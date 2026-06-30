@@ -59,7 +59,13 @@ for date_dir in "$REMOTE_DATASET_DIR"/*/; do
         echo "Copying sequence locally using rsync..."
         local_seq_dir="$LOCAL_TEMP_DIR/$seq_name"
         mkdir -p "$local_seq_dir"
-        rsync -a --info=progress2 "$seq_dir" "$local_seq_dir/"
+        rsync -a --info=progress2 \
+          --include='zedx_left/***' \
+          --include='zedx_right/***' \
+          --include='calib/***' \
+          --include='vectornav.csv' \
+          --exclude='*' \
+          "$seq_dir" "$local_seq_dir/"
         
         if [ ! -d "$local_seq_dir" ]; then
             echo "Error: Failed to copy $seq_name locally to $local_seq_dir. Skipping."
