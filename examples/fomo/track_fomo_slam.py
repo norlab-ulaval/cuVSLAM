@@ -246,7 +246,7 @@ elif os.path.exists(trajectory_file) and os.path.exists(map_path):
             f"IDX ({IDX}) is out of bounds for loaded trajectory of length {len(trajectory_data)}"
         )
     guess_tum_pose = trajectory_data[IDX]
-    guess_pose = cuvslam.Pose(translation=guess_tum_pose[:3], rotation=guess_tum_pose[3:])
+    guess_pose = cuvslam.Pose(translation=guess_tum_pose[1:4], rotation=guess_tum_pose[4:])
 
 start_timestamp_ns = timestamps[IDX] if IDX < len(timestamps) else 0
 
@@ -324,6 +324,7 @@ else:
 trajectory = []
 trajectory_slam = []
 trajectory_tum = []
+trajectory_odom_tum = []
 loop_closure_poses = []
 loop_closures_log = []
 timing_logs = []
@@ -400,7 +401,7 @@ for metadata in frames_metadata:
 
     timing_logs.append({
         'frame': frame_idx,
-        'timestamp': timestamp,
+        'timestamp': f"{(timestamp / 1_000_000_000.0):.6f}",
         'odom_time_ms': odom_time_ms,
         'slam_time_ms': slam_time_ms,
         'total_time_ms': odom_time_ms + slam_time_ms,
@@ -445,7 +446,8 @@ for metadata in frames_metadata:
 
     trajectory.append(current_pose.translation)
     trajectory_slam.append(slam_pose.translation)
-    trajectory_tum.append(list(slam_pose.translation) + list(slam_pose.rotation))
+    trajectory_tum.append([timestamp / 1_000_000_000.0] + list(slam_pose.translation) + list(slam_pose.rotation))
+    trajectory_odom_tum.append([timestamp / 1_000_000_000.0] + list(current_pose.translation) + list(current_pose.rotation))
 
     current_lc_poses = tracker.get_loop_closure_poses()
     if current_lc_poses:
@@ -454,8 +456,8 @@ for metadata in frames_metadata:
             print(f"[Loop Closure] Detected new loop closure at frame {frame_idx} (timestamp: {newest_lc.timestamp_ns})")
             loop_closures_log.append({
                 'timestamp_ns': newest_lc.timestamp_ns,
-                'translation': list(newest_lc.pose.translation),
-                'rotation': list(newest_lc.pose.rotation)
+                'translation': [float(x) for x in newest_lc.pose.translation],
+                'rotation': [float(x) for x in newest_lc.pose.rotation]
             })
             loop_closure_poses.append(newest_lc.pose.translation)
 
@@ -522,7 +524,15 @@ if args.output_filepath:
     
     out_traj_file = os.path.join(args.output_filepath, 'trajectory_tum.txt')
     print(f"[Save] Saving trajectory to {out_traj_file} (length {len(trajectory_tum)})")
-    savetxt(out_traj_file, trajectory_tum)
+    with open(out_traj_file, 'w') as f:
+        for item in trajectory_tum:
+            f.write(f"{item[0]:.6f} {item[1]:.9f} {item[2]:.9f} {item[3]:.9f} {item[4]:.9f} {item[5]:.9f} {item[6]:.9f} {item[7]:.9f}\n")
+
+    out_odom_traj_file = os.path.join(args.output_filepath, 'trajectory_odom_tum.txt')
+    print(f"[Save] Saving Odom trajectory to {out_odom_traj_file} (length {len(trajectory_odom_tum)})")
+    with open(out_odom_traj_file, 'w') as f:
+        for item in trajectory_odom_tum:
+            f.write(f"{item[0]:.6f} {item[1]:.9f} {item[2]:.9f} {item[3]:.9f} {item[4]:.9f} {item[5]:.9f} {item[6]:.9f} {item[7]:.9f}\n")
 
     lc_file = os.path.join(args.output_filepath, "loop_closures.json")
     with open(lc_file, "w") as f:
@@ -530,7 +540,9 @@ if args.output_filepath:
     print(f"[Save] Saved {len(loop_closures_log)} loop closures to {lc_file}")
 
     if guess_pose is None:
-        tracker.save_map(args.output_filepath, save_callback)
+        temp_map_dir = os.path.join(args.output_filepath, "map_temp")
+        os.makedirs(temp_map_dir, exist_ok=True)
+        tracker.save_map(temp_map_dir, save_callback)
 
         start_time = time.time()
         while not map_saved and (time.time() - start_time) < max_wait_time:
@@ -538,6 +550,21 @@ if args.output_filepath:
 
         if map_saved:
             print("[Save] Map saved successfully")
+            temp_data_file = os.path.join(temp_map_dir, "data.mdb")
+            target_map_file = os.path.join(args.output_filepath, "map.mdb")
+            if os.path.exists(temp_data_file):
+                import shutil
+                try:
+                    shutil.move(temp_data_file, target_map_file)
+                    print(f"[Save] Renamed map database to {target_map_file}")
+                except Exception as e:
+                    print(f"[Warning] Failed to rename map: {e}")
+            try:
+                for item in os.listdir(temp_map_dir):
+                    os.remove(os.path.join(temp_map_dir, item))
+                os.rmdir(temp_map_dir)
+            except Exception as e:
+                print(f"[Warning] Failed to clean up temp map directory: {e}")
         else:
             print("[Warning] Map saving may not have completed")
 
@@ -548,6 +575,7 @@ try:
     del trajectory
     del trajectory_slam
     del trajectory_tum
+    del trajectory_odom_tum
     del loop_closure_poses
     del tracker
     del cameras
