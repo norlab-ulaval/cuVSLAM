@@ -18,6 +18,7 @@ import argparse
 import threading
 import time
 import csv
+import queue
 import concurrent.futures
 import numpy as np
 from PIL import Image
@@ -327,7 +328,26 @@ loop_closure_poses = []
 loop_closures_log = []
 timing_logs = []
 
-executor = concurrent.futures.ThreadPoolExecutor(max_workers=2)
+executor = concurrent.futures.ThreadPoolExecutor(max_workers=8)
+
+def load_images(image_paths):
+    return [asarray(Image.open(p).convert('L')) for p in image_paths]
+
+# Bounded queue to preload/preprocess input images (load 100 images)
+image_queue = queue.Queue(maxsize=100)
+
+camera_frames = [meta for meta in frames_metadata if meta['type'] == 'camera']
+
+def image_producer():
+    try:
+        for meta in camera_frames:
+            future = executor.submit(load_images, meta['images_paths'])
+            image_queue.put((meta['timestamp'], future))
+    except Exception:
+        pass
+
+producer_thread = threading.Thread(target=image_producer, daemon=True)
+producer_thread.start()
 
 frame_idx = 0
 
@@ -337,6 +357,7 @@ for metadata in frames_metadata:
 
     if timestamp <= skip_until_ns:
         if metadata['type'] == 'camera':
+            image_queue.get()
             frame_idx += 1
         continue
 
@@ -359,10 +380,9 @@ for metadata in frames_metadata:
 
     # Camera frame
     t_frame_start = time.perf_counter()
-    images = list(executor.map(
-        lambda p: asarray(Image.open(p).convert('L')),
-        metadata['images_paths']
-    ))
+    q_timestamp, image_future = image_queue.get()
+    assert q_timestamp == timestamp, f"Timestamp mismatch: queue {q_timestamp} vs frame {timestamp}"
+    images = image_future.result()
     t_img_end = time.perf_counter()
 
     odometry_pose_estimate = tracker.odom.track(timestamp, images, None, None, None)
