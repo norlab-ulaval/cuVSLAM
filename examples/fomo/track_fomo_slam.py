@@ -28,6 +28,9 @@ import rerun as rr
 import rerun.blueprint as rrb
 import cuvslam
 
+from fomo_sdk.tf.utils import FoMoTFTree
+from scipy.spatial.transform import Rotation
+
 parser = argparse.ArgumentParser(description="Track FOMO dataset sequence with SLAM")
 parser.add_argument("--sequence_dir", type=str, required=True, help="Path to the sequence directory")
 parser.add_argument("--slam_sync_mode", action="store_true", help="Enable sync slam thread")
@@ -35,6 +38,8 @@ parser.add_argument("--idx", type=int, default=700, help="Starting index of the 
 parser.add_argument("--max_wait_time", type=float, default=10.0, help="Max wait time in seconds")
 parser.add_argument("--output_filepath", type=str, default="", help="Output filepath. If empty, don't save.")
 parser.add_argument("--no_vis", action="store_true", help="Disable rerun visualization")
+parser.add_argument("--no_slam", action="store_true", help="Disable SLAM (run Odometry only)")
+parser.add_argument("--no_imu", action="store_true", help="Disable IMU (run Visual Odometry only)")
 args = parser.parse_args()
 
 # Dataset sequence to track and visualize
@@ -49,6 +54,79 @@ quaternion_multiply = lambda q1, q2: (R.from_quat(q1) * R.from_quat(q2)).as_quat
 
 # Lambda to rotate a 3D vector using a 3x3 rotation matrix
 rotate_vector = lambda vector, rotation_matrix: R.from_matrix(rotation_matrix).apply(vector)
+
+tf_tree = FoMoTFTree()
+
+
+def transform_to_pose(transform_matrix: np.ndarray) -> cuvslam.Pose:
+    """Convert a 4x4 transformation matrix to a cuvslam.Pose object."""
+    rotation_quat = Rotation.from_matrix(transform_matrix[:3, :3]).as_quat()
+    return cuvslam.Pose(rotation=rotation_quat, translation=transform_matrix[:3, 3])
+
+class Noise():
+    def __init__(self, gnd, grw, acnd, acrw):
+        self.gnd = gnd
+        self.grw = grw
+        self.acnd = acnd
+        self.acrw = acrw
+
+def get_imu_noise(file_path: str) -> Noise:    
+    imu_data = {
+        "accelerometer": {},
+        "gyroscope": {}
+    }
+    
+    current_sensor = None
+    
+    with open(file_path, 'r') as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+                
+            # Determine which sensor block we are in
+            if line.startswith("ACCELEROMETER:"):
+                current_sensor = "accelerometer"
+                continue
+            elif line.startswith("GYROSCOPE:"):
+                current_sensor = "gyroscope"
+                continue
+                
+            # Parse the key-value pairs if we are inside a sensor block
+            if current_sensor and ':' in line:
+                key, values_str = line.split(':', 1)
+                key = key.strip()
+                
+                # Split the remaining string by whitespace and grab the first token
+                tokens = values_str.split()
+                if tokens:
+                    try:
+                        # The first token is always the primary numerical value
+                        val = float(tokens[0])
+                        imu_data[current_sensor][key] = val
+                    except ValueError:
+                        # Skip lines that don't have a parseable float first
+                        continue
+    # print(imu_data)
+
+    acc = imu_data["accelerometer"]
+    # nd = ""
+    rw = "Accel Random Walk"
+    # acnd = 
+    acrw = np.linalg.norm(np.array([acc["X "+ rw], acc["Y "+ rw], acc["Z "+ rw]]))
+
+
+    # same values as orbslam3
+    # IMU.NoiseGyro: 6.170024194584988e-5 # 2.44e-4 #1e-3 # rad/s^0.5
+    # IMU.NoiseAcc: 0.0014475547298752243 # 1.47e-3 #1e-2 # m/s^1.5
+    # IMU.GyroWalk: 1.2754866476100412e-6 # rad/s^1.5
+    # IMU.AccWalk: 1.743080431796351e-5 # m/s^2.5
+
+    acnd = 0.0014475547298752243
+    acrw = 1.743080431796351e-5
+    gnd = 6.170024194584988e-05
+    grw = 1.2754866476100412e-06
+    return Noise(gnd, grw, acnd, acrw)
 
 
 def combine_poses(initial_pose, relative_pose):
@@ -114,7 +192,7 @@ if not args.no_vis:
             column_shares=[0.5, 0.5],
             contents=[
                 rrb.Vertical(contents=[
-                    rrb.Spatial2DView(origin='world/cam0'),
+                    rrb.Spatial2DView(origin='world/car/cam0'),
                     rrb.Vertical(contents=[
                         rrb.TimeSeriesView(
                         name="IMU Acceleration",
@@ -141,10 +219,10 @@ if not args.no_vis:
         )
     ))
 
-    rr.log("world", rr.ViewCoordinates.RIGHT_HAND_Y_DOWN, static=True)
+    rr.log("world", rr.ViewCoordinates.RIGHT_HAND_Z_UP, static=True)
 
     rr.log("world/xyz", rr.Arrows3D(
-        vectors=[[50, 0, 0], [0, 50, 0], [0, 0, 50]],
+        vectors=[[20, 0, 0], [0, 20, 0], [0, 0, 20]],
         colors=[[255, 0, 0], [0, 255, 0], [0, 0, 255]],
         labels=['[x]', '[y]', '[z]']
     ), static=True)
@@ -152,20 +230,33 @@ if not args.no_vis:
 SLAM_SYNC_MODE = args.slam_sync_mode
 IDX = args.idx
 max_wait_time = args.max_wait_time
+USE_SLAM = not args.no_slam
+USE_IMU = not args.no_imu
 
 with open(os.path.join(calib_path, 'transforms.json'), 'r') as f:
     transforms = json.load(f)
 
 cameras = [cuvslam.Camera(), cuvslam.Camera()]
 
-for t in transforms:
-    if t["to"] == "zedx_right" and t["from"] == "zedx_left":
-        p = t["position"]
-        cameras[1].rig_from_camera = cuvslam.Pose(
-            translation=[p["x"], 0.0, 0.0],
-            rotation=[0.0, 0.0, 0.0, 1.0]
-        )
-        break
+# zedx left to base_link
+tf_zedx_left_to_base_link = tf_tree.get_transform(from_frame="base_link", to_frame="zedx_left")
+
+# remove the rotation before right and left zedx lenses
+tf_zedx_right_to_base_link = tf_zedx_left_to_base_link
+
+tf_zedx_right_to_zedx_left = tf_tree.get_transform(from_frame="zedx_left", to_frame="zedx_right")
+
+translation_only = np.eye(4)
+translation_only[:3, 3] = tf_zedx_right_to_zedx_left[:3, 3]
+
+tf_zedx_right_to_base_link = tf_zedx_left_to_base_link @ translation_only
+
+print(tf_zedx_left_to_base_link)
+print()
+print(tf_zedx_right_to_base_link)
+
+cameras[0].rig_from_camera = transform_to_pose(tf_zedx_left_to_base_link)
+cameras[1].rig_from_camera = transform_to_pose(tf_zedx_right_to_base_link)
 
 left_dir = os.path.join(sequence_path, "zedx_left")
 right_dir = os.path.join(sequence_path, "zedx_right")
@@ -184,34 +275,41 @@ for i, intrinsics in enumerate([left_intrinsics, right_intrinsics]):
     cameras[i].principal = [intrinsics["k"][2], intrinsics["k"][5]]
 
 # IMU Configuration
-imu = cuvslam.ImuCalibration()
-for t in transforms:
-    if t["to"] == "vectornav" and t["from"] == "zedx_left":
-        p = t["position"]
-        q = t["orientation"]
-        imu.rig_from_imu = cuvslam.Pose(
-            translation=[p["x"], p["y"], p["z"]],
-            rotation=[q["x"], q["y"], q["z"], q["w"]]
-        )
+if USE_IMU:
+    # vectornav to base_link
+    # tf_vectornav_to_base_link = tf_tree.get_transform(from_frame="vectornav", to_frame="base_link")
+    tf_vectornav_to_base_link = tf_tree.get_transform(from_frame="base_link", to_frame="vectornav")
 
-imu.gyroscope_noise_density = 5.55e-5
-imu.gyroscope_random_walk = 1.05e-6
-imu.accelerometer_noise_density = 1.14e-3
-imu.accelerometer_random_walk = 1.6e-5
-imu.frequency = 200.0
+    imu = cuvslam.ImuCalibration()
+    imu.rig_from_imu = transform_to_pose(tf_vectornav_to_base_link)
+
+    noise = get_imu_noise(os.path.join(calib_path, 'allan-vectornav.txt'))
+
+    imu.gyroscope_noise_density = noise.gnd
+    imu.gyroscope_random_walk = noise.grw
+    imu.accelerometer_noise_density = noise.acnd
+    imu.accelerometer_random_walk = noise.acrw
+    imu.frequency = 200.0
 
 rig = cuvslam.Rig()
 rig.cameras = cameras
-rig.imus = [imu]
+if USE_IMU:
+    rig.imus = [imu]
+
+odometry_mode = cuvslam.Tracker.OdometryMode.Inertial if USE_IMU else cuvslam.Tracker.OdometryMode.Multicamera
 
 cfg = cuvslam.Tracker.OdometryConfig(
     async_sba=False,
     enable_final_landmarks_export=True,
     rectified_stereo_camera=True,
-    odometry_mode=cuvslam.Tracker.OdometryMode.Inertial
+    odometry_mode=odometry_mode
 )
-s_cfg = cuvslam.Tracker.SlamConfig(sync_mode=SLAM_SYNC_MODE)
-tracker = cuvslam.Tracker(rig, cfg, s_cfg)
+
+if USE_SLAM:
+    s_cfg = cuvslam.Tracker.SlamConfig(sync_mode=SLAM_SYNC_MODE)
+    tracker = cuvslam.Tracker(rig, cfg, s_cfg)
+else:
+    tracker = cuvslam.Tracker(rig, cfg)
 
 timestamps = [int(os.path.splitext(f)[0]) * 1000 for f in filenames]
 
@@ -290,7 +388,7 @@ with open(imu_csv_path, 'r') as f:
 frames_metadata.sort(key=lambda x: x['timestamp'])
 
 # Localize in map if applicable
-if os.path.exists(map_path) and (guess_pose is not None):
+if USE_SLAM and os.path.exists(map_path) and (guess_pose is not None):
     init_images = None
     for meta in frames_metadata:
         if meta['type'] == 'camera' and meta['timestamp'] == start_timestamp_ns:
@@ -363,6 +461,9 @@ for metadata in frames_metadata:
         continue
 
     if metadata['type'] == 'imu':
+        if not USE_IMU:
+            continue
+
         imu_measurement = cuvslam.ImuMeasurement()
         imu_measurement.timestamp_ns = timestamp
         imu_measurement.linear_accelerations = np.asarray(metadata['accel'])
@@ -390,7 +491,7 @@ for metadata in frames_metadata:
     t_odom_end = time.perf_counter()
     
     slam_pose = None
-    if tracker.slam and odometry_pose_estimate.world_from_rig:
+    if USE_SLAM and hasattr(tracker, 'slam') and tracker.slam and odometry_pose_estimate.world_from_rig:
         state = tracker.odom.get_state()
         slam_pose = tracker.slam.track(state, None)
     t_slam_end = time.perf_counter()
@@ -436,7 +537,7 @@ for metadata in frames_metadata:
         fetch_time_ms = (time.perf_counter() - t_fetch_start) * 1000.0
         transform_time_ms = 0.0
         
-    gravity = tracker.get_last_gravity()
+    gravity = tracker.get_last_gravity() if USE_IMU else None
 
     if needs_viz:
         observations_uv = [[o.u, o.v] for o in observations]
@@ -445,30 +546,34 @@ for metadata in frames_metadata:
         landmarks_colors = [color_from_id(l.id) for l in landmarks]
 
     trajectory.append(current_pose.translation)
-    trajectory_slam.append(slam_pose.translation)
-    trajectory_tum.append([timestamp / 1_000_000_000.0] + list(slam_pose.translation) + list(slam_pose.rotation))
+    if USE_SLAM and slam_pose is not None:
+        trajectory_slam.append(slam_pose.translation)
+        trajectory_tum.append([timestamp / 1_000_000_000.0] + list(slam_pose.translation) + list(slam_pose.rotation))
     trajectory_odom_tum.append([timestamp / 1_000_000_000.0] + list(current_pose.translation) + list(current_pose.rotation))
 
-    current_lc_poses = tracker.get_loop_closure_poses()
-    if current_lc_poses:
-        newest_lc = current_lc_poses[-1]
-        if not loop_closures_log or newest_lc.timestamp_ns != loop_closures_log[-1]['timestamp_ns']:
-            print(f"[Loop Closure] Detected new loop closure at frame {frame_idx} (timestamp: {newest_lc.timestamp_ns})")
-            loop_closures_log.append({
-                'timestamp_ns': newest_lc.timestamp_ns,
-                'translation': [float(x) for x in newest_lc.pose.translation],
-                'rotation': [float(x) for x in newest_lc.pose.rotation]
-            })
-            loop_closure_poses.append(newest_lc.pose.translation)
+    if USE_SLAM and hasattr(tracker, 'get_loop_closure_poses'):
+        current_lc_poses = tracker.get_loop_closure_poses()
+        if current_lc_poses:
+            newest_lc = current_lc_poses[-1]
+            if not loop_closures_log or newest_lc.timestamp_ns != loop_closures_log[-1]['timestamp_ns']:
+                print(f"[Loop Closure] Detected new loop closure at frame {frame_idx} (timestamp: {newest_lc.timestamp_ns})")
+                loop_closures_log.append({
+                    'timestamp_ns': newest_lc.timestamp_ns,
+                    'translation': [float(x) for x in newest_lc.pose.translation],
+                    'rotation': [float(x) for x in newest_lc.pose.rotation]
+                })
+                loop_closure_poses.append(newest_lc.pose.translation)
 
     if not args.no_vis:
         rr.set_time_nanos('timestamp', timestamp)
         rr.log('world/trajectory', rr.LineStrips3D(trajectory))
-        rr.log('world/trajectory_slam', rr.LineStrips3D(trajectory_slam))
+        if USE_SLAM and trajectory_slam:
+            rr.log('world/trajectory_slam', rr.LineStrips3D(trajectory_slam))
         rr.log('world/final_landmarks', rr.Points3D(final_landmarks, radii=0.1))
-        rr.log('world/loop_closure_poses', rr.Points3D(
-            loop_closure_poses, radii=1.2, colors=[[255, 0, 0]]
-        ))
+        if USE_SLAM and loop_closure_poses:
+            rr.log('world/loop_closure_poses', rr.Points3D(
+                loop_closure_poses, radii=1.2, colors=[[255, 0, 0]]
+            ))
         rr.log('world/car', rr.Transform3D(
             translation=current_pose.translation,
             quaternion=current_pose.rotation
@@ -480,15 +585,19 @@ for metadata in frames_metadata:
         rr.log('world/car/landmarks_lines', rr.Arrows3D(
             vectors=landmark_xyz, radii=0.05, colors=landmarks_colors
         ))
-        rr.log('world/cam0', rr.Pinhole(
+        rr.log('world/car/cam0', rr.Transform3D(
+            translation=tf_zedx_left_to_base_link[:3, 3],
+            mat3x3=tf_zedx_left_to_base_link[:3, :3]
+        ))
+        rr.log('world/car/cam0', rr.Pinhole(
             image_plane_distance=1.68,
             focal_length=[left_intrinsics["k"][0], left_intrinsics["k"][4]],
             principal_point=[left_intrinsics["k"][2], left_intrinsics["k"][5]],
             width=size[0],
             height=size[1]
         ))
-        rr.log('world/cam0/image', rr.Image(images[0]).compress(jpeg_quality=80))
-        rr.log('world/cam0/observations', rr.Points2D(
+        rr.log('world/car/cam0/image', rr.Image(images[0]).compress(jpeg_quality=80))
+        rr.log('world/car/cam0/observations', rr.Points2D(
             observations_uv, radii=5, colors=observations_colors
         ))
         
@@ -522,11 +631,12 @@ print(f"[Save] Saved timing logs to {timing_csv_file}")
 if args.output_filepath:
     os.makedirs(args.output_filepath, exist_ok=True)
     
-    out_traj_file = os.path.join(args.output_filepath, 'trajectory_tum.txt')
-    print(f"[Save] Saving trajectory to {out_traj_file} (length {len(trajectory_tum)})")
-    with open(out_traj_file, 'w') as f:
-        for item in trajectory_tum:
-            f.write(f"{item[0]:.6f} {item[1]:.9f} {item[2]:.9f} {item[3]:.9f} {item[4]:.9f} {item[5]:.9f} {item[6]:.9f} {item[7]:.9f}\n")
+    if USE_SLAM:
+        out_traj_file = os.path.join(args.output_filepath, 'trajectory_tum.txt')
+        print(f"[Save] Saving trajectory to {out_traj_file} (length {len(trajectory_tum)})")
+        with open(out_traj_file, 'w') as f:
+            for item in trajectory_tum:
+                f.write(f"{item[0]:.6f} {item[1]:.9f} {item[2]:.9f} {item[3]:.9f} {item[4]:.9f} {item[5]:.9f} {item[6]:.9f} {item[7]:.9f}\n")
 
     out_odom_traj_file = os.path.join(args.output_filepath, 'trajectory_odom_tum.txt')
     print(f"[Save] Saving Odom trajectory to {out_odom_traj_file} (length {len(trajectory_odom_tum)})")
@@ -534,12 +644,13 @@ if args.output_filepath:
         for item in trajectory_odom_tum:
             f.write(f"{item[0]:.6f} {item[1]:.9f} {item[2]:.9f} {item[3]:.9f} {item[4]:.9f} {item[5]:.9f} {item[6]:.9f} {item[7]:.9f}\n")
 
-    lc_file = os.path.join(args.output_filepath, "loop_closures.json")
-    with open(lc_file, "w") as f:
-        json.dump(loop_closures_log, f, indent=4)
-    print(f"[Save] Saved {len(loop_closures_log)} loop closures to {lc_file}")
+    if USE_SLAM:
+        lc_file = os.path.join(args.output_filepath, "loop_closures.json")
+        with open(lc_file, "w") as f:
+            json.dump(loop_closures_log, f, indent=4)
+        print(f"[Save] Saved {len(loop_closures_log)} loop closures to {lc_file}")
 
-    if guess_pose is None:
+    if USE_SLAM and guess_pose is None:
         temp_map_dir = os.path.join(args.output_filepath, "map_temp")
         os.makedirs(temp_map_dir, exist_ok=True)
         tracker.save_map(temp_map_dir, save_callback)
@@ -580,7 +691,8 @@ try:
     del tracker
     del cameras
     del cfg
-    del s_cfg
+    if USE_SLAM:
+        del s_cfg
 except Exception as e:
     print(f"Warning during cleanup: {e}")
 

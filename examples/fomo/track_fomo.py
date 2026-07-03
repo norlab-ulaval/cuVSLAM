@@ -23,41 +23,44 @@ import cuvslam
 
 # Parse arguments
 parser = argparse.ArgumentParser(description="Track FOMO dataset sequence")
-parser.add_argument("--sequence", type=str, default="00", choices=["00", "01"], help="Sequence to track")
+parser.add_argument("--sequence_dir", type=str, required=True, help="Path to the sequence directory")
+parser.add_argument("--output_filepath", type=str, default="", help="Output filepath. If empty, don't save.")
+parser.add_argument("--no_vis", action="store_true", help="Disable rerun visualization")
 args = parser.parse_args()
 
-# Set up dataset path
-dataset_path = os.path.join(os.path.dirname(__file__), "dataset")
-sequence_path = os.path.join(dataset_path, "sequences", args.sequence)
+# Set up dataset path matching the second script's structure
+sequence_path = os.path.abspath(args.sequence_dir)
+calib_path = os.path.join(sequence_path, "calib")
 
 # Generate pseudo-random colour from integer identifier for visualization
 def color_from_id(identifier):
     return [(identifier * 17) % 256, (identifier * 31) % 256, (identifier * 47) % 256]
 
-# Setup rerun visualizer
-rr.init('fomo', strict=True, spawn=True)  # launch re-run instance
+if not args.no_vis:
+    # Setup rerun visualizer
+    rr.init('fomo', strict=True, spawn=True)  # launch re-run instance
 
-# Setup rerun views
-rr.send_blueprint(rrb.Blueprint(
-    rrb.TimePanel(state="collapsed"),
-    rrb.Vertical(
-        row_shares=[0.6, 0.4],
-        contents=[rrb.Spatial3DView(), rrb.Spatial2DView(origin='car/cam0')]
-    )
-))
+    # Setup rerun views
+    rr.send_blueprint(rrb.Blueprint(
+        rrb.TimePanel(state="collapsed"),
+        rrb.Vertical(
+            row_shares=[0.6, 0.4],
+            contents=[rrb.Spatial3DView(), rrb.Spatial2DView(origin='car/cam0')]
+        )
+    ))
 
-# Setup coordinate basis for root, cuvslam uses right-hand system with X-right, Y-down, Z-forward
-rr.log("/", rr.ViewCoordinates.RIGHT_HAND_Y_DOWN, static=True)
+    # Setup coordinate basis for root, cuvslam uses right-hand system with X-right, Y-down, Z-forward
+    rr.log("/", rr.ViewCoordinates.RIGHT_HAND_Y_DOWN, static=True)
 
-# Draw arrays in origin X-red, Y-green, Z-blue
-rr.log("xyz", rr.Arrows3D(
-    vectors=[[50, 0, 0], [0, 50, 0], [0, 0, 50]],
-    colors=[[255, 0, 0], [0, 255, 0], [0, 0, 255]],
-    labels=['[x]', '[y]', '[z]']
-), static=True)
+    # Draw arrays in origin X-red, Y-green, Z-blue
+    rr.log("xyz", rr.Arrows3D(
+        vectors=[[50, 0, 0], [0, 50, 0], [0, 0, 50]],
+        colors=[[255, 0, 0], [0, 255, 0], [0, 0, 255]],
+        labels=['[x]', '[y]', '[z]']
+    ), static=True)
 
 # Load FOMO dataset transforms
-with open(os.path.join(dataset_path, 'transforms.json'), 'r') as f:
+with open(os.path.join(calib_path, 'transforms.json'), 'r') as f:
     transforms = json.load(f)
 
 cameras = [cuvslam.Camera(), cuvslam.Camera()]
@@ -78,9 +81,9 @@ filenames = sorted(os.listdir(left_dir))
 # Get size from the first image
 size = Image.open(os.path.join(left_dir, filenames[0])).size
 
-with open(os.path.join(dataset_path, 'zedx_left.json'), 'r') as f:
+with open(os.path.join(calib_path, 'zedx_left.json'), 'r') as f:
     left_intrinsics = json.load(f)
-with open(os.path.join(dataset_path, 'zedx_right.json'), 'r') as f:
+with open(os.path.join(calib_path, 'zedx_right.json'), 'r') as f:
     right_intrinsics = json.load(f)
 
 for i, intrinsics in enumerate([left_intrinsics, right_intrinsics]):
@@ -101,6 +104,8 @@ timestamps = [int(os.path.splitext(f)[0]) * 1000 for f in filenames]
 
 # Track each frames in the dataset sequence
 trajectory = []
+trajectory_odom_tum = []
+
 for frame in range(len(timestamps)):
     f_name = filenames[frame]
     # Load grayscale pixels as array for left and right absolute image paths
@@ -119,41 +124,61 @@ for frame in range(len(timestamps)):
     # Get current pose and observations for the main camera and gravity in rig frame
     odom_pose = odom_pose_estimate.world_from_rig.pose
 
-    # Get visualization data
-    observations = tracker.get_last_observations(0)  # get observation from left camera
-    landmarks = tracker.get_last_landmarks()
-    final_landmarks = tracker.get_final_landmarks()
-
-    # Prepare visualization data
-    observations_uv = [[o.u, o.v] for o in observations]
-    observations_colors = [color_from_id(o.id) for o in observations]
-    landmark_xyz = [l.coords for l in landmarks]
-    landmarks_colors = [color_from_id(l.id) for l in landmarks]
     trajectory.append(odom_pose.translation)
+    
+    # Store TUM format trajectory
+    trajectory_odom_tum.append([
+        timestamps[frame] / 1_000_000_000.0,
+        odom_pose.translation[0], odom_pose.translation[1], odom_pose.translation[2],
+        odom_pose.rotation[0], odom_pose.rotation[1], odom_pose.rotation[2], odom_pose.rotation[3]
+    ])
 
-    # Send results to rerun for visualization
-    rr.set_time_sequence('frame', frame)
-    rr.log('trajectory', rr.LineStrips3D(trajectory))
-    rr.log('final_landmarks', rr.Points3D(list(final_landmarks.values()), radii=0.1))
-    rr.log('car', rr.Transform3D(
-        translation=odom_pose.translation,
-        quaternion=odom_pose.rotation
-    ))
-    rr.log('car/body', rr.Boxes3D(centers=[0, 1.65 / 2, 0], sizes=[[1.6, 1.65, 2.71]]))
-    rr.log('car/landmarks_center', rr.Points3D(
-        landmark_xyz, radii=0.25, colors=landmarks_colors
-    ))
-    rr.log('car/landmarks_lines', rr.Arrows3D(
-        vectors=landmark_xyz, radii=0.05, colors=landmarks_colors
-    ))
-    rr.log('car/cam0', rr.Pinhole(
-        image_plane_distance=1.68,
-        focal_length=[left_intrinsics["k"][0], left_intrinsics["k"][4]],
-        principal_point=[left_intrinsics["k"][2], left_intrinsics["k"][5]],
-        width=size[0],
-        height=size[1]
-    ))
-    rr.log('car/cam0/image', rr.Image(images[0]).compress(jpeg_quality=80))
-    rr.log('car/cam0/observations', rr.Points2D(
-        observations_uv, radii=5, colors=observations_colors
-    ))
+    if not args.no_vis:
+        # Get visualization data
+        observations = tracker.get_last_observations(0)  # get observation from left camera
+        landmarks = tracker.get_last_landmarks()
+        final_landmarks = tracker.get_final_landmarks()
+
+        # Prepare visualization data
+        observations_uv = [[o.u, o.v] for o in observations]
+        observations_colors = [color_from_id(o.id) for o in observations]
+        landmark_xyz = [l.coords for l in landmarks]
+        landmarks_colors = [color_from_id(l.id) for l in landmarks]
+
+        # Send results to rerun for visualization
+        rr.set_time_sequence('frame', frame)
+        rr.log('trajectory', rr.LineStrips3D(trajectory))
+        rr.log('final_landmarks', rr.Points3D(list(final_landmarks.values()), radii=0.1))
+        rr.log('car', rr.Transform3D(
+            translation=odom_pose.translation,
+            quaternion=odom_pose.rotation
+        ))
+        rr.log('car/body', rr.Boxes3D(centers=[0, 1.65 / 2, 0], sizes=[[1.6, 1.65, 2.71]]))
+        rr.log('car/landmarks_center', rr.Points3D(
+            landmark_xyz, radii=0.25, colors=landmarks_colors
+        ))
+        rr.log('car/landmarks_lines', rr.Arrows3D(
+            vectors=landmark_xyz, radii=0.05, colors=landmarks_colors
+        ))
+        rr.log('car/cam0', rr.Pinhole(
+            image_plane_distance=1.68,
+            focal_length=[left_intrinsics["k"][0], left_intrinsics["k"][4]],
+            principal_point=[left_intrinsics["k"][2], left_intrinsics["k"][5]],
+            width=size[0],
+            height=size[1]
+        ))
+        rr.log('car/cam0/image', rr.Image(images[0]).compress(jpeg_quality=80))
+        rr.log('car/cam0/observations', rr.Points2D(
+            observations_uv, radii=5, colors=observations_colors
+        ))
+
+# Save output trajectory if specified
+if args.output_filepath:
+    os.makedirs(args.output_filepath, exist_ok=True)
+    out_odom_traj_file = os.path.join(args.output_filepath, 'trajectory_odom_tum.txt')
+    print(f"[Save] Saving Odom trajectory to {out_odom_traj_file} (length {len(trajectory_odom_tum)})")
+    with open(out_odom_traj_file, 'w') as f:
+        for item in trajectory_odom_tum:
+            f.write(f"{item[0]:.6f} {item[1]:.9f} {item[2]:.9f} {item[3]:.9f} {item[4]:.9f} {item[5]:.9f} {item[6]:.9f} {item[7]:.9f}\n")
+
+print("Script completed")

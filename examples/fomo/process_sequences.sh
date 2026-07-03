@@ -2,13 +2,13 @@
 # process_sequences.sh
 # Usage: ./process_sequences.sh <remote_dataset_dir> <local_temp_dir> <output_dir>
 
-REMOTE_DATASET_DIR=$1
-LOCAL_TEMP_DIR=$2
-OUTPUT_DIR=$3
+REMOTE_DATASET_DIR="/run/user/2002/gvfs/sftp:host=192.168.1.10,user=mabox/FoMo/ijrr"
+LOCAL_TEMP_DIR="/tmp/fomo_data"
+OUTPUT_DIR="/home/robot/Desktop/output"
 
 # Array of colors to process. e.g. ("red" "blue" "green" "yellow" "orange" "magenta")
 # If empty, no sequences will be processed.
-COLORS_TO_PROCESS=("red" "blue" "green" "yellow" "orange" "magenta")
+COLORS_TO_PROCESS=("green" "yellow" "magenta")
 
 if [ -z "$REMOTE_DATASET_DIR" ] || [ -z "$LOCAL_TEMP_DIR" ] || [ -z "$OUTPUT_DIR" ]; then
     echo "Usage: ./process_sequences.sh <remote_dataset_dir> <local_temp_dir> <output_dir>"
@@ -59,7 +59,13 @@ for date_dir in "$REMOTE_DATASET_DIR"/*/; do
         echo "Copying sequence locally using rsync..."
         local_seq_dir="$LOCAL_TEMP_DIR/$seq_name"
         mkdir -p "$local_seq_dir"
-        rsync -a --info=progress2 "$seq_dir" "$local_seq_dir/"
+        rsync -a --info=progress2 \
+		  --include='zedx_left/***' \
+		  --include='zedx_right/***' \
+		  --include='calib/***' \
+		  --include='vectornav.csv' \
+		  --exclude='*' \
+		  "$seq_dir" "$local_seq_dir/"
         
         if [ ! -d "$local_seq_dir" ]; then
             echo "Error: Failed to copy $seq_name locally to $local_seq_dir. Skipping."
