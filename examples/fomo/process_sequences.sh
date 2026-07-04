@@ -86,7 +86,7 @@ for current_color in "${COLORS_TO_PROCESS[@]}"; do
 
             # 3. Process
             echo "Running SLAM processing (logging to $log_file)..."
-            python3 track_fomo_slam.py --slam_sync_mode --sequence_dir "$local_seq_dir" --output_filepath "$proc_dir" --no_vis > "$log_file" 2>&1
+            python3 track_fomo.py --slam_sync_mode --sequence_dir "$local_seq_dir" --output_filepath "$proc_dir" --no_vis > "$log_file" 2>&1
             SLAM_EXIT_CODE=$?
 
             # 4. Stop monitor
