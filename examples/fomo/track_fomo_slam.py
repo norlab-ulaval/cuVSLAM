@@ -358,6 +358,7 @@ localization_complete = threading.Event()
 slam_initial_pose = None
 guess_pose = None
 map_saved = False
+total_db_landmarks = 0
 
 loc_settings = cuvslam.Tracker.SlamLocalizationSettings(
     horizontal_search_radius=8.,
@@ -700,7 +701,19 @@ for metadata in frames_metadata:
         if args.localize:
             if localization_complete.is_set():
                 initial_map_size = num_final_landmarks
-                print(f"\n[Verification] Localization succeeded! Loaded map with {initial_map_size} landmarks.")
+                try:
+                    import lmdb
+                    env = lmdb.open(map_path, readonly=True, lock=False, max_dbs=10)
+                    with env.begin() as txn:
+                        sub_db = env.open_db(b"landmarks", txn=txn)
+                        total_db_landmarks = txn.stat(sub_db)['entries']
+                except Exception as e:
+                    print(f"Failed to read LMDB: {e}")
+                    total_db_landmarks = 0
+
+                print(f"\n[Verification] Localization succeeded!")
+                print(f"  -> Local active map window: {initial_map_size} landmarks")
+                print(f"  -> Total loaded map database: {total_db_landmarks} landmarks")
             elif frame_idx == 0:
                 # Set a fallback in case localization never completes, so it isn't None at the end
                 initial_map_size = num_final_landmarks
@@ -736,6 +749,37 @@ if initial_map_size is not None:
             print("[Verification] STATUS: SUCCESS (System correctly operated in localization mode)")
         else:
             print("[Verification] STATUS: WARNING (System added too many landmarks, may have fallen back to mapping)")
+
+if args.localize:
+    print("\n[Verification] Saving map to temporary directory to verify final map size in RAM...")
+    temp_map_path = map_path + "_temp"
+    os.makedirs(temp_map_path, exist_ok=True)
+    map_saved = False
+    tracker.save_map(temp_map_path, save_callback)
+
+    start_time = time.time()
+    while not map_saved and (time.time() - start_time) < max_wait_time:
+        time.sleep(0.1)
+
+    if map_saved:
+        try:
+            import lmdb
+            env = lmdb.open(temp_map_path, readonly=True, lock=False, max_dbs=10)
+            with env.begin() as txn:
+                sub_db = env.open_db(b"landmarks", txn=txn)
+                final_db_landmarks = txn.stat(sub_db)['entries']
+
+            print(f"[Verification] Initial map database had: {total_db_landmarks} landmarks.")
+            print(f"[Verification] Final map database has: {final_db_landmarks} landmarks.")
+            diff = final_db_landmarks - total_db_landmarks
+            print(f"[Verification] Difference: {diff} landmarks.")
+        except Exception as e:
+            print(f"Failed to read temp map: {e}")
+
+        import shutil
+        shutil.rmtree(temp_map_path, ignore_errors=True)
+    else:
+        print("[Verification] Failed to save temporary map.")
 
 # Modify output path if localizing
 if args.output_filepath and guess_pose is not None:
