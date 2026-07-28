@@ -13,6 +13,7 @@
 # of the software or derivative works thereof, you agree to be bound by this License.
 
 import os
+import sys
 import json
 import argparse
 import threading
@@ -44,6 +45,29 @@ parser.add_argument("--localize", action="store_true", help="Enable localization
 args = parser.parse_args()
 
 args.no_imu = True
+
+if args.output_filepath:
+    log_dir = args.output_filepath
+    if args.localize:
+        seq_name = os.path.basename(os.path.normpath(args.sequence_dir))
+        map_path_test = os.path.join(args.output_filepath, 'map')
+        traj_test = os.path.join(args.output_filepath, 'trajectory_tum.txt')
+        if os.path.exists(map_path_test) and os.path.exists(traj_test) and args.idx >= 0:
+            log_dir = os.path.join(args.output_filepath, "loc_" + seq_name)
+    
+    os.makedirs(log_dir, exist_ok=True)
+    class Logger(object):
+        def __init__(self, filename):
+            self.terminal = sys.stdout
+            self.log = open(filename, "w")
+        def write(self, message):
+            self.terminal.write(message)
+            self.log.write(message)
+            self.log.flush()
+        def flush(self):
+            self.terminal.flush()
+            self.log.flush()
+    sys.stdout = Logger(os.path.join(log_dir, "log.txt"))
 
 # Dataset sequence to track and visualize
 sequence_path = os.path.abspath(args.sequence_dir)
