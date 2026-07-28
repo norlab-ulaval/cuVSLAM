@@ -482,9 +482,15 @@ producer_thread.start()
 
 frame_idx = 0
 
+last_camera_frame_time = time.perf_counter()
+total_sleep_time_since_last_cam = 0.0
+
 # Main tracking loop
 for metadata in frames_metadata:
-    time.sleep(0.01)  # Give the async SLAM thread time to catch up
+    t_sleep_start = time.perf_counter()
+    if metadata['type'] != 'imu':
+        time.sleep(0.01)  # Give the async SLAM thread time to catch up
+    total_sleep_time_since_last_cam += (time.perf_counter() - t_sleep_start)
     timestamp = metadata['timestamp']
 
     if timestamp <= skip_until_ns:
@@ -539,7 +545,10 @@ for metadata in frames_metadata:
         'odom_time_ms': odom_time_ms,
         'slam_time_ms': slam_time_ms,
         'total_time_ms': odom_time_ms + slam_time_ms,
-        'full_frame_time_ms': 0.0
+        'full_frame_time_ms': 0.0,
+        'viz_time_ms': 0.0,
+        'loop_time_ms': 0.0,
+        'sleep_time_ms': 0.0
     })
 
     if odometry_pose_estimate.world_from_rig is None:
@@ -557,16 +566,25 @@ for metadata in frames_metadata:
     
     needs_viz = not args.no_vis
     needs_print = (frame_idx % 50 == 0 or frame_idx == len(timestamps) - 1)
+    needs_map_size = needs_viz or needs_print or (initial_map_size is None)
     
-    if needs_viz or needs_print:
+    num_final_landmarks = 0
+    final_landmarks = []
+    
+    if needs_viz:
         raw_final_landmarks = list(tracker.get_final_landmarks().values())
         t_fetch_end = time.perf_counter()
         final_landmarks = transform_landmarks(raw_final_landmarks, slam_initial_pose)
+        num_final_landmarks = len(final_landmarks)
         t_transform_end = time.perf_counter()
         fetch_time_ms = (t_fetch_end - t_fetch_start) * 1000.0
         transform_time_ms = (t_transform_end - t_fetch_end) * 1000.0
+    elif needs_map_size:
+        num_final_landmarks = len(tracker.get_final_landmarks())
+        t_fetch_end = time.perf_counter()
+        fetch_time_ms = (t_fetch_end - t_fetch_start) * 1000.0
+        transform_time_ms = 0.0
     else:
-        final_landmarks = []
         fetch_time_ms = (time.perf_counter() - t_fetch_start) * 1000.0
         transform_time_ms = 0.0
         
@@ -601,6 +619,7 @@ for metadata in frames_metadata:
                 })
                 loop_closure_poses.append(newest_lc.pose.translation)
 
+    t_viz_start = time.perf_counter()
     if not args.no_vis:
         rr.set_time_nanos('timestamp', timestamp)
         rr.log('world/trajectory', rr.LineStrips3D(trajectory))
@@ -640,19 +659,29 @@ for metadata in frames_metadata:
         
         if gravity is not None:
             rr.log('world/car/gravity', rr.Arrows3D(vectors=[gravity], colors=[[255, 0, 0]], radii=0.05))
+    t_viz_end = time.perf_counter()
 
-    timing_logs[-1]['full_frame_time_ms'] = (time.perf_counter() - t_frame_start) * 1000.0
+    current_camera_frame_time = time.perf_counter()
+    loop_time_ms = (current_camera_frame_time - last_camera_frame_time) * 1000.0
+    last_camera_frame_time = current_camera_frame_time
+
+    timing_logs[-1]['full_frame_time_ms'] = (t_viz_end - t_frame_start) * 1000.0
+    timing_logs[-1]['viz_time_ms'] = (t_viz_end - t_viz_start) * 1000.0
+    timing_logs[-1]['loop_time_ms'] = loop_time_ms
+    timing_logs[-1]['sleep_time_ms'] = total_sleep_time_since_last_cam * 1000.0
+    
+    total_sleep_time_since_last_cam = 0.0
 
     if initial_map_size is None:
         if args.localize:
             if localization_complete.is_set():
-                initial_map_size = len(final_landmarks)
+                initial_map_size = num_final_landmarks
                 print(f"\n[Verification] Localization succeeded! Loaded map with {initial_map_size} landmarks.")
             elif frame_idx == 0:
                 # Set a fallback in case localization never completes, so it isn't None at the end
-                initial_map_size = len(final_landmarks)
+                initial_map_size = num_final_landmarks
         else:
-            initial_map_size = len(final_landmarks)
+            initial_map_size = num_final_landmarks
             print(f"\n[Verification] Mapping started. Initial landmarks: {initial_map_size}")
 
     if frame_idx % 50 == 0 or frame_idx == len(timestamps) - 1:
@@ -660,17 +689,20 @@ for metadata in frames_metadata:
         avg_odom = sum(l['odom_time_ms'] for l in recent_logs) / len(recent_logs)
         avg_slam = sum(l['slam_time_ms'] for l in recent_logs) / len(recent_logs)
         avg_full = sum(l['full_frame_time_ms'] for l in recent_logs) / len(recent_logs)
+        avg_viz = sum(l['viz_time_ms'] for l in recent_logs) / len(recent_logs)
+        avg_loop = sum(l['loop_time_ms'] for l in recent_logs) / len(recent_logs)
+        avg_sleep = sum(l['sleep_time_ms'] for l in recent_logs) / len(recent_logs)
         loc_status = ""
         if args.localize:
             loc_status = " | LOC: OK" if localization_complete.is_set() else " | LOC: pending"
-        print(f"[Progress] Frame {frame_idx}/{len(timestamps)} | Odom: {avg_odom:.1f}ms | SLAM: {avg_slam:.1f}ms | Full: {avg_full:.1f}ms | Obs: {len(observations)} | Map LMs: {len(final_landmarks)}{loc_status}")
-        print(f"  -> Breakdown of current frame: Img: {img_time_ms:.1f}ms, Fetch: {fetch_time_ms:.1f}ms, Transform: {transform_time_ms:.1f}ms")
+        print(f"[Progress] Frame {frame_idx}/{len(timestamps)} | Odom: {avg_odom:.1f}ms | SLAM: {avg_slam:.1f}ms | Full(w/ viz): {avg_full:.1f}ms | Loop(Total): {avg_loop:.1f}ms | Obs: {len(observations)} | Map LMs: {num_final_landmarks}{loc_status}")
+        print(f"  -> Breakdown: Img: {img_time_ms:.1f}ms, Fetch: {fetch_time_ms:.1f}ms, Transform: {transform_time_ms:.1f}ms, Viz: {avg_viz:.1f}ms, Sleep(total): {avg_sleep:.1f}ms")
 
     frame_idx += 1
 
 print(f"\nNumber of loop closure poses: {len(loop_closure_poses)}")
 
-final_map_size = len(final_landmarks) if 'final_landmarks' in locals() else 0
+final_map_size = num_final_landmarks if 'num_final_landmarks' in locals() else 0
 print(f"[Verification] Final Map Size: {final_map_size} landmarks.")
 if initial_map_size is not None:
     added_landmarks = final_map_size - initial_map_size
@@ -691,7 +723,7 @@ timing_dir = args.output_filepath if args.output_filepath else "."
 os.makedirs(timing_dir, exist_ok=True)
 timing_csv_file = os.path.join(timing_dir, "timing_logs.csv")
 with open(timing_csv_file, 'w', newline='') as f:
-    writer = csv.DictWriter(f, fieldnames=['frame', 'timestamp', 'odom_time_ms', 'slam_time_ms', 'total_time_ms', 'full_frame_time_ms'])
+    writer = csv.DictWriter(f, fieldnames=['frame', 'timestamp', 'odom_time_ms', 'slam_time_ms', 'total_time_ms', 'full_frame_time_ms', 'viz_time_ms', 'loop_time_ms', 'sleep_time_ms'])
     writer.writeheader()
     writer.writerows(timing_logs)
 print(f"[Save] Saved timing logs to {timing_csv_file}")
