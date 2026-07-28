@@ -18,6 +18,9 @@
 #include "slam/async_slam/async_slam.h"
 
 #include <stdexcept>
+#include <algorithm>
+#include <iostream>
+#include <memory>
 #include <string>
 #include <thread>
 
@@ -75,6 +78,7 @@ AsyncSlam::AsyncSlam(const camera::Rig& rig, const std::vector<CameraId>& camera
   // no second thread here - safe access to all data
   options_ = options;
   slam_->SetReproduceMode(reproduce_mode_);
+  slam_->SetEnableMapping(options.enable_mapping);
   slam_->SetLandmarksSpatialIndex(options.spatial_index_options);
   const bool randomized = !reproduce_mode_;
   loop_closure_solver_.reset(
@@ -138,6 +142,10 @@ void AsyncSlam::TrackResult(FrameId frameId, int64_t timestamp_ns, const odom::I
   VO_IncrementFrameData(frameId, timestamp_ns, delta, track_data_);
 
   if (is_keyframe && !images.empty()) {
+    if (!options_.enable_mapping) {
+      fprintf(stderr, "[Localization Only] VO generated a keyframe, but SLAM graph addition is bypassed.\n");
+    }
+
     const auto vo_keyframe = std::make_shared<VOKeyframeInfo>(VOKeyframeInfo());
     const Isometry3T current_pose = GetSlamPose();
 
@@ -383,6 +391,10 @@ void AsyncSlam::ProcessInput() {
     {
       const VOTrackData& track_data = vo_kf->track_data;
 
+      if (!options_.enable_mapping) {
+        //fprintf(stderr, "[Localization Only] Skipping AddKeyframe (mapping disabled).\n");
+        continue;
+      }
       Isometry3T last_keyframe_pose;
       int64_t last_keyframe_ts;
       if (slam_->GetLastKeyframePoseAndTimestamp(last_keyframe_pose, last_keyframe_ts) && last_keyframe_ts > 0 &&

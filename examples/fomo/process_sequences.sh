@@ -4,11 +4,11 @@
 
 REMOTE_DATASET_DIR="/run/user/2002/gvfs/sftp:host=192.168.1.10,user=mabox/FoMo/ijrr"
 LOCAL_TEMP_DIR="/tmp/fomo_data"
-OUTPUT_DIR="/home/robot/Desktop/output2"
+OUTPUT_DIR="/home/robot/Desktop/output_no_imu"
 
 # Array of colors to process. e.g. ("red" "blue" "green" "yellow" "orange" "magenta")
 # If empty, no sequences will be processed.
-COLORS_TO_PROCESS=("green" "yellow" "magenta")
+COLORS_TO_PROCESS=("red" "blue" "orange")
 
 if [ -z "$REMOTE_DATASET_DIR" ] || [ -z "$LOCAL_TEMP_DIR" ] || [ -z "$OUTPUT_DIR" ]; then
     echo "Usage: ./process_sequences.sh <remote_dataset_dir> <local_temp_dir> <output_dir>"
@@ -86,7 +86,7 @@ for current_color in "${COLORS_TO_PROCESS[@]}"; do
 
             # 3. Process
             echo "Running SLAM processing (logging to $log_file)..."
-            python3 track_fomo_slam.py --slam_sync_mode --sequence_dir "$local_seq_dir" --output_filepath "$proc_dir" --no_vis > "$log_file" 2>&1
+            python3 track_fomo_slam.py --slam_sync_mode --sequence_dir "$local_seq_dir" --output_filepath "$proc_dir" --no_vis --no_imu > "$log_file" 2>&1
             SLAM_EXIT_CODE=$?
 
             # 4. Stop monitor

@@ -50,6 +50,7 @@ struct AsyncSlamOptions {
   float max_landmarks_distance = std::numeric_limits<float>::max();
   LoopClosureSolverType loop_closure_solver_type = LoopClosureSolverType::kTwoStepsEasy;
   bool planar_constraints = false;
+  bool enable_mapping = true;
 };
 
 struct AsyncSlamLCTelemetry {

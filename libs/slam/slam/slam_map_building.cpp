@@ -16,6 +16,7 @@
  */
 
 #include <functional>
+#include <iostream>
 #include <vector>
 
 #include "common/isometry.h"
@@ -32,6 +33,10 @@ namespace cuvslam::slam {
 
 void LocalizerAndMapper::AddKeyframe(const Isometry3T& from_last_keyframe, const VOFrameData& frame_data,
                                      const Images& images) {
+  if (!enable_mapping_) {
+    return;
+  }
+
   Isometry3T pose_estimate = GetCurrentPose() * from_last_keyframe;
   RemoveScaleFromTransform(pose_estimate);
 

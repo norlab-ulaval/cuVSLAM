@@ -117,6 +117,9 @@ public:
   void SetKeepTrackPoses(bool keep_track_poses);
   bool GetKeepTrackPoses() const;
 
+  void SetEnableMapping(bool enable_mapping);
+  bool GetEnableMapping() const;
+
   // should be called once before any call of AddKeyframe or SetLost
   void SetActiveCameras(const std::vector<CameraId>& cameras);
   std::optional<std::vector<CameraId>> GetActiveCameras() const;
@@ -309,6 +312,7 @@ private:
   PoseGraphOptimizerOptions pg_options_;
   std::string pose_graph_optimizer_;
   size_t max_keyframes_count_ = 0;  // 0 means no limit
+  bool enable_mapping_ = true;
 
   // Before merged into the map, landmarks wait in 'staging3d_' until
   // 'staging_keyframes_thresh' keyframes pass without their tracking.

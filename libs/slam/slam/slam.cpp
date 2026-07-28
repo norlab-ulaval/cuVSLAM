@@ -109,6 +109,9 @@ void LocalizerAndMapper::SetKeepTrackPoses(bool keep_track_poses) {
 
 bool LocalizerAndMapper::GetKeepTrackPoses() const { return keep_track_poses_; }
 
+void LocalizerAndMapper::SetEnableMapping(bool enable_mapping) { enable_mapping_ = enable_mapping; }
+bool LocalizerAndMapper::GetEnableMapping() const { return enable_mapping_; }
+
 void LocalizerAndMapper::SetActiveCameras(const std::vector<CameraId>& cameras) {
   if (active_cameras_) {
     throw std::runtime_error("Set active camera should be called once before map update.");

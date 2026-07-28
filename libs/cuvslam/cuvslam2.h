@@ -742,6 +742,8 @@ public:
     /// How long the past is preserved. Maximum time to keep odometries delta history to be able to process
     /// LocalizeInMap within timestamps from past.
     uint32_t retention_time_ms = 5000;
+    /// Enable mapping (adding new keyframes and landmarks). Set to false for pure localization.
+    bool enable_mapping = true;
   };
 
   // TODO(vikuznetsov): remove when https://gcc.gnu.org/bugzilla/show_bug.cgi?id=88165 is fixed
