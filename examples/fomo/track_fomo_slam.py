@@ -34,13 +34,16 @@ from scipy.spatial.transform import Rotation
 parser = argparse.ArgumentParser(description="Track FOMO dataset sequence with SLAM")
 parser.add_argument("--sequence_dir", type=str, required=True, help="Path to the sequence directory")
 parser.add_argument("--slam_sync_mode", action="store_true", help="Enable sync slam thread")
-parser.add_argument("--idx", type=int, default=700, help="Starting index of the sequence after localization. If negative, don't localize but run SLAM and map.")
+parser.add_argument("--idx", type=int, default=0, help="Starting index of the sequence after localization. If negative, don't localize but run SLAM and map.")
 parser.add_argument("--max_wait_time", type=float, default=10.0, help="Max wait time in seconds")
 parser.add_argument("--output_filepath", type=str, default="", help="Output filepath. If empty, don't save.")
 parser.add_argument("--no_vis", action="store_true", help="Disable rerun visualization")
 parser.add_argument("--no_slam", action="store_true", help="Disable SLAM (run Odometry only)")
 parser.add_argument("--no_imu", action="store_true", help="Disable IMU (run Visual Odometry only)")
+parser.add_argument("--localize", action="store_true", help="Enable localization using existing map. Otherwise runs SLAM and mapping.")
 args = parser.parse_args()
+
+args.no_imu = True
 
 # Dataset sequence to track and visualize
 sequence_path = os.path.abspath(args.sequence_dir)
@@ -227,7 +230,7 @@ if not args.no_vis:
         labels=['[x]', '[y]', '[z]']
     ), static=True)
 
-SLAM_SYNC_MODE = args.slam_sync_mode
+SLAM_SYNC_MODE = False
 IDX = args.idx
 max_wait_time = args.max_wait_time
 USE_SLAM = not args.no_slam
@@ -250,10 +253,6 @@ translation_only = np.eye(4)
 translation_only[:3, 3] = tf_zedx_right_to_zedx_left[:3, 3]
 
 tf_zedx_right_to_base_link = tf_zedx_left_to_base_link @ translation_only
-
-print(tf_zedx_left_to_base_link)
-print()
-print(tf_zedx_right_to_base_link)
 
 cameras[0].rig_from_camera = transform_to_pose(tf_zedx_left_to_base_link)
 cameras[1].rig_from_camera = transform_to_pose(tf_zedx_right_to_base_link)
@@ -290,6 +289,8 @@ if USE_IMU:
     imu.accelerometer_noise_density = noise.acnd
     imu.accelerometer_random_walk = noise.acrw
     imu.frequency = 200.0
+else:
+    print("Not using IMU")
 
 rig = cuvslam.Rig()
 rig.cameras = cameras
@@ -306,7 +307,12 @@ cfg = cuvslam.Tracker.OdometryConfig(
 )
 
 if USE_SLAM:
-    s_cfg = cuvslam.Tracker.SlamConfig(sync_mode=SLAM_SYNC_MODE)
+    # Use async SLAM (sync_mode=False) even during localization.
+    # With sync_mode=True, localize_in_map() itself blocks until done, which
+    # freezes the script for large maps. In async mode, localize_in_map()
+    # returns immediately and the blocking frame-feeding loop below drives
+    # the localization to completion via incremental tracker.track() calls.
+    s_cfg = cuvslam.Tracker.SlamConfig(sync_mode=SLAM_SYNC_MODE, enable_mapping=not args.localize)
     tracker = cuvslam.Tracker(rig, cfg, s_cfg)
 else:
     tracker = cuvslam.Tracker(rig, cfg)
@@ -314,11 +320,15 @@ else:
 timestamps = [int(os.path.splitext(f)[0]) * 1000 for f in filenames]
 
 # Check if map folder and trajectory file exist
-map_path = os.path.join(sequence_path, 'map')
-trajectory_file = os.path.join(sequence_path, 'trajectory_tum.txt')
+# map/ is used directly for both saving (mapping run) and loading (localization).
+# This matches track_fomo_kitti_slam.py: no rename or copy is needed.
+map_path = os.path.join(args.output_filepath, 'map')
+trajectory_file = os.path.join(args.output_filepath, 'trajectory_tum.txt')
 
-if not os.path.exists(map_path):
-    print(f"Map folder not found at {map_path}")
+if not os.path.exists(map_path) and args.localize:
+    print(f"Map folder not found at {map_path} — localization will not run.")
+elif not os.path.exists(map_path):
+    print(f"Map folder not found at {map_path} (will be created during mapping).")
 
 localization_complete = threading.Event()
 slam_initial_pose = None
@@ -333,7 +343,10 @@ loc_settings = cuvslam.Tracker.SlamLocalizationSettings(
     angular_step_rads=0.03
     )
 
-if IDX < 0:
+if not args.localize:
+    guess_pose = None
+    print("Localization flag not set, skipping localization and running SLAM mapping.")
+elif IDX < 0:
     IDX = 0
     guess_pose = None
     print("IDX is negative, skipping localization and starting SLAM from frame 0.")
@@ -387,7 +400,12 @@ with open(imu_csv_path, 'r') as f:
 
 frames_metadata.sort(key=lambda x: x['timestamp'])
 
-# Localize in map if applicable
+processed_start_frame = False
+# Localize in map if applicable.
+# Mirrors track_fomo_kitti_slam.py: cuVSLAM localization runs fully in the
+# background. No tracker.track() calls are needed to drive it — just wait.
+# Large outdoor maps (thousands of landmarks) need more than the default 10s,
+# so the timeout is max_wait_time * 10 (100s by default).
 if USE_SLAM and os.path.exists(map_path) and (guess_pose is not None):
     init_images = None
     for meta in frames_metadata:
@@ -397,26 +415,39 @@ if USE_SLAM and os.path.exists(map_path) and (guess_pose is not None):
                 asarray(Image.open(meta['images_paths'][1]).convert('L'))
             ]
             break
-            
+
     if init_images is not None:
+        if not args.no_vis:
+            rr.set_time_nanos('timestamp', start_timestamp_ns)
+            rr.log('world/car/cam0/image', rr.Image(init_images[0]))
+
+        # Seed frame: track once, then kick off async localization
+        processed_start_frame = True
         _, _ = tracker.track(start_timestamp_ns, init_images)
-        tracker.localize_in_map(map_path, start_timestamp_ns, guess_pose, init_images, loc_settings, localization_start_cb, localization_finish_cb)
-        
-        wait_time = 0
-        while not SLAM_SYNC_MODE and not localization_complete.wait(timeout=0.5) and wait_time < max_wait_time:
-            print(f"Waiting for localization... {wait_time}s")
+        tracker.localize_in_map(map_path, start_timestamp_ns, guess_pose, init_images,
+                                loc_settings, localization_start_cb, localization_finish_cb)
+
+        # Wait passively for the async localization callback to fire.
+        # The search is CPU/GPU-bound; no additional track() calls are needed.
+        loc_timeout_s = max_wait_time * 10  # generous: 100s by default
+        wait_time = 0.0
+        while not SLAM_SYNC_MODE and not localization_complete.wait(timeout=0.5) and wait_time < loc_timeout_s:
+            print(f"Waiting for localization... elapsed: {wait_time:.0f}s / {loc_timeout_s:.0f}s")
             wait_time += 0.5
-            
         if not localization_complete.is_set():
-            print(f"Localization did not complete within {max_wait_time} seconds")
+            print(f"[Localization] Did not complete within {loc_timeout_s:.0f}s.")
+            exit(1)
 
 # Determine fast-forward logic
-skip_until_ns = -1
+skip_until_ns = start_timestamp_ns if processed_start_frame else -1
 if slam_initial_pose is not None and guess_pose is not None:
     print(f"Localized pose: {slam_initial_pose}")
-    skip_until_ns = start_timestamp_ns
 else:
-    print("Warning: slam_initial_pose is None, set initial pose to zero, starting frame to 0, ignore map if exists")
+    if args.localize and guess_pose is None:
+        import sys
+        print("Error: --localize flag is set, but guess_pose is None (trajectory missing). Exiting.")
+        sys.exit(1)
+    print("Warning: slam_initial_pose is None (or localization failed), setting initial tracking origin to zero.")
     slam_initial_pose = cuvslam.Pose(translation=[0, 0, 0], rotation=[0, 0, 0, 1])
 
 trajectory = []
@@ -424,6 +455,7 @@ trajectory_slam = []
 trajectory_tum = []
 trajectory_odom_tum = []
 loop_closure_poses = []
+initial_map_size = None
 loop_closures_log = []
 timing_logs = []
 
@@ -452,6 +484,7 @@ frame_idx = 0
 
 # Main tracking loop
 for metadata in frames_metadata:
+    time.sleep(0.01)  # Give the async SLAM thread time to catch up
     timestamp = metadata['timestamp']
 
     if timestamp <= skip_until_ns:
@@ -547,8 +580,12 @@ for metadata in frames_metadata:
 
     trajectory.append(current_pose.translation)
     if USE_SLAM and slam_pose is not None:
-        trajectory_slam.append(slam_pose.translation)
-        trajectory_tum.append([timestamp / 1_000_000_000.0] + list(slam_pose.translation) + list(slam_pose.rotation))
+        # Only record SLAM trajectory after localization has confirmed a pose.
+        # (In mapping mode localization_complete is never set, so the condition
+        # evaluates to True via the `not args.localize` branch.)
+        if not args.localize or localization_complete.is_set():
+            trajectory_slam.append(slam_pose.translation)
+            trajectory_tum.append([timestamp / 1_000_000_000.0] + list(slam_pose.translation) + list(slam_pose.rotation))
     trajectory_odom_tum.append([timestamp / 1_000_000_000.0] + list(current_pose.translation) + list(current_pose.rotation))
 
     if USE_SLAM and hasattr(tracker, 'get_loop_closure_poses'):
@@ -596,7 +633,7 @@ for metadata in frames_metadata:
             width=size[0],
             height=size[1]
         ))
-        rr.log('world/car/cam0/image', rr.Image(images[0]).compress(jpeg_quality=80))
+        rr.log('world/car/cam0/image', rr.Image(images[0]))
         rr.log('world/car/cam0/observations', rr.Points2D(
             observations_uv, radii=5, colors=observations_colors
         ))
@@ -606,17 +643,48 @@ for metadata in frames_metadata:
 
     timing_logs[-1]['full_frame_time_ms'] = (time.perf_counter() - t_frame_start) * 1000.0
 
+    if initial_map_size is None:
+        if args.localize:
+            if localization_complete.is_set():
+                initial_map_size = len(final_landmarks)
+                print(f"\n[Verification] Localization succeeded! Loaded map with {initial_map_size} landmarks.")
+            elif frame_idx == 0:
+                # Set a fallback in case localization never completes, so it isn't None at the end
+                initial_map_size = len(final_landmarks)
+        else:
+            initial_map_size = len(final_landmarks)
+            print(f"\n[Verification] Mapping started. Initial landmarks: {initial_map_size}")
+
     if frame_idx % 50 == 0 or frame_idx == len(timestamps) - 1:
         recent_logs = timing_logs[-50:] if len(timing_logs) >= 50 else timing_logs
         avg_odom = sum(l['odom_time_ms'] for l in recent_logs) / len(recent_logs)
         avg_slam = sum(l['slam_time_ms'] for l in recent_logs) / len(recent_logs)
         avg_full = sum(l['full_frame_time_ms'] for l in recent_logs) / len(recent_logs)
-        print(f"[Progress] Frame {frame_idx}/{len(timestamps)} | Odom: {avg_odom:.1f}ms | SLAM: {avg_slam:.1f}ms | Full: {avg_full:.1f}ms | Obs: {len(observations)} | Map LMs: {len(final_landmarks)}")
+        loc_status = ""
+        if args.localize:
+            loc_status = " | LOC: OK" if localization_complete.is_set() else " | LOC: pending"
+        print(f"[Progress] Frame {frame_idx}/{len(timestamps)} | Odom: {avg_odom:.1f}ms | SLAM: {avg_slam:.1f}ms | Full: {avg_full:.1f}ms | Obs: {len(observations)} | Map LMs: {len(final_landmarks)}{loc_status}")
         print(f"  -> Breakdown of current frame: Img: {img_time_ms:.1f}ms, Fetch: {fetch_time_ms:.1f}ms, Transform: {transform_time_ms:.1f}ms")
 
     frame_idx += 1
 
-print(f"Number of loop closure poses: {len(loop_closure_poses)}")
+print(f"\nNumber of loop closure poses: {len(loop_closure_poses)}")
+
+final_map_size = len(final_landmarks) if 'final_landmarks' in locals() else 0
+print(f"[Verification] Final Map Size: {final_map_size} landmarks.")
+if initial_map_size is not None:
+    added_landmarks = final_map_size - initial_map_size
+    print(f"[Verification] Landmarks added during sequence: {added_landmarks}")
+    if args.localize:
+        if added_landmarks < 500:
+            print("[Verification] STATUS: SUCCESS (System correctly operated in localization mode)")
+        else:
+            print("[Verification] STATUS: WARNING (System added too many landmarks, may have fallen back to mapping)")
+
+# Modify output path if localizing
+if args.output_filepath and guess_pose is not None:
+    seq_name = os.path.basename(os.path.normpath(args.sequence_dir))
+    args.output_filepath = os.path.join(args.output_filepath, "loc_" + seq_name)
 
 # Save timing logs
 timing_dir = args.output_filepath if args.output_filepath else "."
@@ -651,31 +719,15 @@ if args.output_filepath:
         print(f"[Save] Saved {len(loop_closures_log)} loop closures to {lc_file}")
 
     if USE_SLAM and guess_pose is None:
-        temp_map_dir = os.path.join(args.output_filepath, "map_temp")
-        os.makedirs(temp_map_dir, exist_ok=True)
-        tracker.save_map(temp_map_dir, save_callback)
+        os.makedirs(map_path, exist_ok=True)
+        tracker.save_map(map_path, save_callback)
 
         start_time = time.time()
         while not map_saved and (time.time() - start_time) < max_wait_time:
             time.sleep(0.1)
 
         if map_saved:
-            print("[Save] Map saved successfully")
-            temp_data_file = os.path.join(temp_map_dir, "data.mdb")
-            target_map_file = os.path.join(args.output_filepath, "map.mdb")
-            if os.path.exists(temp_data_file):
-                import shutil
-                try:
-                    shutil.move(temp_data_file, target_map_file)
-                    print(f"[Save] Renamed map database to {target_map_file}")
-                except Exception as e:
-                    print(f"[Warning] Failed to rename map: {e}")
-            try:
-                for item in os.listdir(temp_map_dir):
-                    os.remove(os.path.join(temp_map_dir, item))
-                os.rmdir(temp_map_dir)
-            except Exception as e:
-                print(f"[Warning] Failed to clean up temp map directory: {e}")
+            print(f"[Save] Map saved successfully to {map_path}")
         else:
             print("[Warning] Map saving may not have completed")
 
@@ -697,3 +749,8 @@ except Exception as e:
     print(f"Warning during cleanup: {e}")
 
 print("Script completed")
+
+if args.localize and not localization_complete.is_set():
+    import sys
+    print("Error: Failed to localize across the entire sequence.")
+    sys.exit(1)
