@@ -31,7 +31,7 @@ import cuvslam
 parser = argparse.ArgumentParser(description="Track FOMO dataset sequence with SLAM")
 parser.add_argument("--sequence_dir", type=str, required=True, help="Path to the sequence directory")
 parser.add_argument("--slam_sync_mode", action="store_true", help="Enable sync slam thread")
-parser.add_argument("--idx", type=int, default=700, help="Starting index of the sequence after localization. If negative, don't localize but run SLAM and map.")
+parser.add_argument("--idx", type=int, default=0, help="Starting index of the sequence after localization. If negative, don't localize but run SLAM and map.")
 parser.add_argument("--max_wait_time", type=float, default=10.0, help="Max wait time in seconds")
 parser.add_argument("--output_filepath", type=str, default="", help="Output filepath. If empty, don't save.")
 parser.add_argument("--no_vis", action="store_true", help="Disable rerun visualization")
@@ -165,8 +165,24 @@ timestamps = [
 map_path = os.path.join(sequence_path, 'map')
 trajectory_file = os.path.join(sequence_path, 'trajectory_tum.txt')
 
+if args.output_filepath:
+    out_map_dir = os.path.join(args.output_filepath, 'map')
+    out_map_file = os.path.join(args.output_filepath, 'map.mdb')
+    
+    if os.path.exists(out_map_file):
+        os.makedirs(out_map_dir, exist_ok=True)
+        import shutil
+        shutil.move(out_map_file, os.path.join(out_map_dir, 'data.mdb'))
+        map_path = out_map_dir
+    elif os.path.exists(out_map_dir):
+        map_path = out_map_dir
+        
+    out_traj_path = os.path.join(args.output_filepath, 'trajectory_slam_tum.txt')
+    if os.path.exists(out_traj_path):
+        trajectory_file = out_traj_path
+
 if not os.path.exists(map_path):
-    print(f"Map folder not found at {map_path}")
+    print(f"Map folder/file not found at {map_path}")
 
 localization_complete = threading.Event()
 slam_initial_pose = None
@@ -414,39 +430,43 @@ for metadata in frames_metadata:
 print(f"Number of loop closure poses: {len(loop_closure_poses)}")
 
 # Save timing logs
-timing_dir = args.output_filepath if args.output_filepath else "."
-os.makedirs(timing_dir, exist_ok=True)
-timing_csv_file = os.path.join(timing_dir, "timing_logs.csv")
-with open(timing_csv_file, 'w', newline='') as f:
-    writer = csv.DictWriter(f, fieldnames=['frame', 'timestamp', 'odom_time_ms', 'slam_time_ms', 'total_time_ms', 'full_frame_time_ms'])
-    writer.writeheader()
-    writer.writerows(timing_logs)
-print(f"[Save] Saved timing logs to {timing_csv_file}")
+if guess_pose is None:
+    timing_dir = args.output_filepath if args.output_filepath else "."
+    os.makedirs(timing_dir, exist_ok=True)
+    timing_csv_file = os.path.join(timing_dir, "timing_logs.csv")
+    with open(timing_csv_file, 'w', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=['frame', 'timestamp', 'odom_time_ms', 'slam_time_ms', 'total_time_ms', 'full_frame_time_ms'])
+        writer.writeheader()
+        writer.writerows(timing_logs)
+    print(f"[Save] Saved timing logs to {timing_csv_file}")
 
 if args.output_filepath:
     os.makedirs(args.output_filepath, exist_ok=True)
     
-    out_traj_file = os.path.join(args.output_filepath, 'trajectory_slam_tum.txt')
+    if guess_pose is not None:
+        out_traj_file = os.path.join(args.output_filepath, 'trajectory_slam_tum_loc.txt')
+    else:
+        out_traj_file = os.path.join(args.output_filepath, 'trajectory_slam_tum.txt')
     print(f"[Save] Saving SLAM trajectory to {out_traj_file} (length {len(trajectory_tum)})")
     with open(out_traj_file, 'w') as f:
         for item in trajectory_tum:
             f.write(f"{item[0]:.6f} {item[1]:.9f} {item[2]:.9f} {item[3]:.9f} {item[4]:.9f} {item[5]:.9f} {item[6]:.9f} {item[7]:.9f}\n")
 
-    out_odom_file = os.path.join(args.output_filepath, 'trajectory_odom_tum.txt')
-    print(f"[Save] Saving Odometry trajectory to {out_odom_file} (length {len(trajectory_odom_tum)})")
-    with open(out_odom_file, 'w') as f:
-        for item in trajectory_odom_tum:
-            f.write(f"{item[0]:.6f} {item[1]:.9f} {item[2]:.9f} {item[3]:.9f} {item[4]:.9f} {item[5]:.9f} {item[6]:.9f} {item[7]:.9f}\n")
-
-    lc_file = os.path.join(args.output_filepath, "loop_closures.json")
-    with open(lc_file, "w") as f:
-        json.dump(loop_closures_log, f, indent=4)
-    print(f"[Save] Saved {len(loop_closures_log)} loop closures to {lc_file}")
-
     if guess_pose is None:
-        temp_map_dir = os.path.join(args.output_filepath, "map_temp")
-        os.makedirs(temp_map_dir, exist_ok=True)
-        tracker.save_map(temp_map_dir, save_callback)
+        out_odom_file = os.path.join(args.output_filepath, 'trajectory_odom_tum.txt')
+        print(f"[Save] Saving Odometry trajectory to {out_odom_file} (length {len(trajectory_odom_tum)})")
+        with open(out_odom_file, 'w') as f:
+            for item in trajectory_odom_tum:
+                f.write(f"{item[0]:.6f} {item[1]:.9f} {item[2]:.9f} {item[3]:.9f} {item[4]:.9f} {item[5]:.9f} {item[6]:.9f} {item[7]:.9f}\n")
+
+        lc_file = os.path.join(args.output_filepath, "loop_closures.json")
+        with open(lc_file, "w") as f:
+            json.dump(loop_closures_log, f, indent=4)
+        print(f"[Save] Saved {len(loop_closures_log)} loop closures to {lc_file}")
+
+        map_dir = os.path.join(args.output_filepath, "map")
+        os.makedirs(map_dir, exist_ok=True)
+        tracker.save_map(map_dir, save_callback)
 
         start_time = time.time()
         while not map_saved and (time.time() - start_time) < max_wait_time:
@@ -454,21 +474,6 @@ if args.output_filepath:
 
         if map_saved:
             print("[Save] Map saved successfully")
-            temp_data_file = os.path.join(temp_map_dir, "data.mdb")
-            target_map_file = os.path.join(args.output_filepath, "map.mdb")
-            if os.path.exists(temp_data_file):
-                import shutil
-                try:
-                    shutil.move(temp_data_file, target_map_file)
-                    print(f"[Save] Renamed map database to {target_map_file}")
-                except Exception as e:
-                    print(f"[Warning] Failed to rename map: {e}")
-            try:
-                for item in os.listdir(temp_map_dir):
-                    os.remove(os.path.join(temp_map_dir, item))
-                os.rmdir(temp_map_dir)
-            except Exception as e:
-                print(f"[Warning] Failed to clean up temp map directory: {e}")
         else:
             print("[Warning] Map saving may not have completed")
 

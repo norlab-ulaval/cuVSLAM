@@ -15,6 +15,7 @@
 import os
 import threading
 import time
+import argparse
 from PIL import Image
 from numpy import loadtxt, asarray, array_equal as np_array_equal, savetxt
 from scipy.spatial.transform import Rotation as R
@@ -22,11 +23,13 @@ import rerun as rr
 import rerun.blueprint as rrb
 import cuvslam
 
+parser = argparse.ArgumentParser(description="Track KITTI dataset sequence with SLAM")
+parser.add_argument("--sequence_dir", type=str, default=os.path.join(os.path.dirname(__file__), "dataset/sequences/06"), help="Path to the sequence directory")
+parser.add_argument("--localize", action="store_true", help="Enable localization using existing map. Otherwise runs SLAM and mapping.")
+args = parser.parse_args()
+
 # Dataset sequence to track and visualize
-sequence_path = os.path.join(
-    os.path.dirname(__file__),
-    "dataset/sequences/06"
-)
+sequence_path = os.path.abspath(args.sequence_dir)
 
 # Lambda to convert quaternion [x, y, z, w] to 3x3 rotation matrix (as list of lists)
 quaternion_to_rotation_matrix = lambda q: R.from_quat(q).as_matrix().tolist()
@@ -79,22 +82,19 @@ def transform_landmarks(landmarks, initial_pose):
     Returns:
         List of transformed 3D landmark coordinates
     """
+    if not landmarks:
+        return []
+
     rotation_matrix = quaternion_to_rotation_matrix(initial_pose.rotation)
-    transformed_landmarks = []
-
-    for landmark in landmarks:
-        # Rotate landmark by initial pose rotation
-        rotated_landmark = rotate_vector(landmark, rotation_matrix)
-
-        # Add initial translation
-        transformed_landmark = [
-            initial_pose.translation[0] + rotated_landmark[0],
-            initial_pose.translation[1] + rotated_landmark[1],
-            initial_pose.translation[2] + rotated_landmark[2]
-        ]
-        transformed_landmarks.append(transformed_landmark)
-
-    return transformed_landmarks
+    
+    # Vectorized transformation using numpy
+    pts = asarray(landmarks)
+    rot = asarray(rotation_matrix)
+    trans = asarray(initial_pose.translation)
+    
+    transformed_pts = (pts @ rot.T) + trans
+    
+    return transformed_pts.tolist()
 
 
 # Save callback to set map_saved to True if map saving is successful
@@ -141,7 +141,7 @@ rr.log("xyz", rr.Arrows3D(
 ), static=True)
 
 SLAM_SYNC_MODE = False  # async slam thread is enabled
-IDX = 700  # starting index of the sequence after localization
+IDX = 0  # starting index of the sequence after localization
 max_wait_time = 10.0  # seconds
 
 # Load KITTI dataset calibration and initilize cameras
@@ -165,7 +165,7 @@ cfg = cuvslam.Tracker.OdometryConfig(
     enable_final_landmarks_export=True,
     rectified_stereo_camera=True
 )
-s_cfg = cuvslam.Tracker.SlamConfig(sync_mode=SLAM_SYNC_MODE)
+s_cfg = cuvslam.Tracker.SlamConfig(sync_mode=SLAM_SYNC_MODE, enable_mapping=not args.localize)
 tracker = cuvslam.Tracker(cuvslam.Rig(cameras), cfg, s_cfg)
 
 # Get timestamps from times.txt file
@@ -197,14 +197,21 @@ loc_settings = cuvslam.Tracker.SlamLocalizationSettings(
     )
 
 # Define guess pose from trajectory file if it exists
-if os.path.exists(trajectory_file) and os.path.exists(map_path):
-    trajectory_data = loadtxt(trajectory_file)
-    if IDX >= len(trajectory_data):
-        raise IndexError(
-            f"IDX ({IDX}) is out of bounds for loaded trajectory of length {len(trajectory_data)}"
-        )
-    guess_tum_pose = trajectory_data[IDX]
-    guess_pose = cuvslam.Pose(translation=guess_tum_pose[:3], rotation=guess_tum_pose[3:])
+if args.localize:
+    print("Running in LOCALIZATION mode")
+    if os.path.exists(trajectory_file) and os.path.exists(map_path):
+        trajectory_data = loadtxt(trajectory_file)
+        if IDX >= len(trajectory_data):
+            raise IndexError(
+                f"IDX ({IDX}) is out of bounds for loaded trajectory of length {len(trajectory_data)}"
+            )
+        guess_tum_pose = trajectory_data[IDX]
+        guess_pose = cuvslam.Pose(translation=guess_tum_pose[:3], rotation=guess_tum_pose[3:])
+    else:
+        print(f"Warning: Map or trajectory file not found in {sequence_path} for localization.")
+else:
+    print("Running in MAPPING mode")
+    guess_pose = None
 
 # If guess pose is not None, localize in map
 if os.path.exists(map_path) and (guess_pose is not None):
@@ -258,9 +265,12 @@ trajectory = []
 trajectory_slam = []
 trajectory_tum = []
 loop_closure_poses = []
+initial_map_size = None
 
 # Track each frames in the dataset sequence
+total_db_landmarks = 0
 for frame in range(IDX, len(timestamps)):
+    # Run on all remaining frames
     time.sleep(0.01) # sleep 10ms to let SLAM thread catch up
 
     # Load grayscale pixels as array for left and right absolute image paths
@@ -270,7 +280,9 @@ for frame in range(IDX, len(timestamps)):
     ]
 
     # Do visual odometry and slam tracking
+    t0 = time.time()
     odometry_pose_estimate, slam_pose = tracker.track(timestamps[frame], images)
+    track_time = time.time() - t0
 
     if odometry_pose_estimate.world_from_rig is None:
         print(f"Warning: Failed to track frame {frame}")
@@ -287,8 +299,31 @@ for frame in range(IDX, len(timestamps)):
     landmarks = tracker.get_last_landmarks()
 
     # Transform final landmarks by the initial pose
+    t1 = time.time()
     raw_final_landmarks = list(tracker.get_final_landmarks().values())
     final_landmarks = transform_landmarks(raw_final_landmarks, slam_initial_pose)
+    transform_time = time.time() - t1
+    
+    if frame % 10 == 0:
+        print(f"[Frame {frame:04d}] tracker.track(): {track_time*1000:.1f} ms | transform_landmarks() ({len(raw_final_landmarks)} pts): {transform_time*1000:.1f} ms")
+
+    if initial_map_size is None:
+        initial_map_size = len(final_landmarks)
+        if args.localize:
+            try:
+                import lmdb
+                env = lmdb.open(map_path, readonly=True, lock=False, max_dbs=10)
+                with env.begin() as txn:
+                    sub_db = env.open_db(b"landmarks", txn=txn)
+                    total_db_landmarks = txn.stat(sub_db)['entries']
+            except Exception as e:
+                print(f"Failed to read LMDB: {e}")
+                
+            print(f"\n[Verification] Localization succeeded!")
+            print(f"  -> Local active map window: {initial_map_size} landmarks")
+            print(f"  -> Total loaded map database: {total_db_landmarks} landmarks")
+        else:
+            print(f"\n[Verification] Mapping started. Initial landmarks: {initial_map_size}")
 
     # Prepare visualization data
     observations_uv = [[o.u, o.v] for o in observations]
@@ -339,11 +374,63 @@ for frame in range(IDX, len(timestamps)):
 
 print(f"Number of loop closure poses: {len(loop_closure_poses)}")
 
-if guess_pose is None:
-    # Save map and trajectory
-    os.makedirs(map_path, exist_ok=True)
-    print(f"Saving trajectory to {trajectory_file} of length {len(trajectory_tum)}")
-    savetxt(trajectory_file, trajectory_tum)
+final_map_size = len(final_landmarks) if 'final_landmarks' in locals() else 0
+print(f"[Verification] Final Map Size: {final_map_size} landmarks.")
+if initial_map_size is not None:
+    added_landmarks = final_map_size - initial_map_size
+    print(f"[Verification] Landmarks added during sequence: {added_landmarks}")
+    if args.localize:
+        print(f"[Verification] In localization mode, added relatively few landmarks: {added_landmarks}")
+
+if args.localize:
+    print("\n[Verification] Saving map to temporary directory to verify final map size in RAM...")
+    temp_map_path = map_path + "_temp"
+    os.makedirs(temp_map_path, exist_ok=True)
+    map_saved = False
+    tracker.save_map(temp_map_path, save_callback)
+    
+    start_time = time.time()
+    while not map_saved and (time.time() - start_time) < max_wait_time:
+        time.sleep(0.1)
+        
+    if map_saved:
+        try:
+            import lmdb
+            env = lmdb.open(temp_map_path, readonly=True, lock=False, max_dbs=10)
+            with env.begin() as txn:
+                sub_db = env.open_db(b"landmarks", txn=txn)
+                final_db_landmarks = txn.stat(sub_db)['entries']
+            
+            print(f"[Verification] Initial map database had: {total_db_landmarks} landmarks.")
+            print(f"[Verification] Final map database has: {final_db_landmarks} landmarks.")
+            diff = final_db_landmarks - total_db_landmarks
+            print(f"[Verification] Difference: {diff} landmarks.")
+            if abs(diff) < 500:
+                print("[Verification] PROOF: The system maintained a stable map size (it was localizing, not mapping).")
+            else:
+                print("[Verification] WARNING: The map grew significantly. It might have been mapping.")
+        except Exception as e:
+            print(f"Failed to read temp map: {e}")
+            
+        import shutil
+        shutil.rmtree(temp_map_path, ignore_errors=True)
+    else:
+        print("[Verification] Failed to save temporary map.")
+
+# Save map and trajectories
+os.makedirs(map_path, exist_ok=True)
+print(f"Saving trajectory_tum to {trajectory_file} of length {len(trajectory_tum)}")
+savetxt(trajectory_file, trajectory_tum)
+
+traj_slam_file = os.path.join(sequence_path, "trajectory_slam.txt")
+print(f"Saving trajectory_slam to {traj_slam_file} of length {len(trajectory_slam)}")
+savetxt(traj_slam_file, trajectory_slam)
+
+traj_odom_file = os.path.join(sequence_path, "trajectory_odom.txt")
+print(f"Saving trajectory_odom to {traj_odom_file} of length {len(trajectory)}")
+savetxt(traj_odom_file, trajectory)
+
+if not args.localize:
 
     tracker.save_map(map_path, save_callback)
 
